@@ -2,12 +2,15 @@
 list conform to the official System One OpenAPI schema (tests/data/systemone_openapi.json)."""
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 import jsonschema
 import pytest
 
-from basal.server import Server, models_payload, named_options, to_items
+import basal.bench as bench_module
+import basal.server as server_module
+from basal.server import Server, default_mode, models_payload, named_options, to_items
 
 SPEC = json.loads((Path(__file__).parent / "data/systemone_openapi.json").read_text())
 
@@ -47,6 +50,44 @@ class FakeServer(Server):
             w.cancel()
 
 
+def test_default_mode_prefers_cuda_over_mlx(monkeypatch):
+    monkeypatch.setattr(server_module.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(server_module.torch.backends.mps, "is_available", lambda: True)
+    assert default_mode() == "fast"
+
+
+def test_benchmark_mps_default_avoids_eager_fp32(monkeypatch):
+    monkeypatch.setattr(bench_module, "default_mode", lambda: "mlx")
+    monkeypatch.setattr(bench_module.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(bench_module.torch.backends.mps, "is_available", lambda: True)
+    assert bench_module.default_modes() == ["mps", "mlx"]
+
+
+def test_benchmark_cuda_default_preserves_fp32_reference(monkeypatch):
+    monkeypatch.setattr(bench_module, "default_mode", lambda: "fast")
+    monkeypatch.setattr(bench_module.torch.cuda, "is_available", lambda: True)
+    assert bench_module.default_modes() == ["eager-fp32", "fast"]
+
+
+def test_benchmark_sync_and_memory_follow_backend_device(monkeypatch):
+    from types import SimpleNamespace
+    import math
+
+    calls = []
+    monkeypatch.setattr(bench_module.torch.mps, "synchronize", lambda: calls.append("mps"))
+    monkeypatch.setattr(bench_module.torch.mps, "driver_allocated_memory", lambda: 2**30)
+    cpu = SimpleNamespace(dev="cpu")
+    mps = SimpleNamespace(dev=bench_module.torch.device("mps"))
+    bench_module.timed(lambda: calls.append("work"), 1, cpu)
+    assert calls == ["work"]
+    assert math.isnan(bench_module.memory_gb(cpu))
+
+    calls.clear()
+    bench_module.timed(lambda: calls.append("work"), 1, mps)
+    assert calls == ["mps", "work", "mps"]
+    assert bench_module.memory_gb(mps) == 1.0
+
+
 def test_named_options_show_keys_by_default():
     assert named_options({"returns": "Returns", "it": "IT"}) == (["returns", "it"], ["returns: Returns", "it: IT"])
     assert named_options({"x": None, "y": "why"})[1] == ["x", "y: why"]
@@ -82,6 +123,22 @@ def test_response_conforms_to_official_schema(q):
 def test_model_list_conforms_to_official_schema():
     jsonschema.validate(models_payload("basal-1.0-4.5B", "fast", {"0.99": None}), schema("ModelMetadataList"))
 
+@pytest.mark.parametrize(("mode", "quant"), [
+    ("eager", "fp8"), ("fast", "q8"), ("mps", "fp8"), ("mlx", "nvfp4"),
+    ("vllm", "fp8"), ("gguf", "q8"), ("mlx", "fp8"), ("mps", "q8"), ("eager", "nvfp4"),
+])
+def test_unsupported_quant_fails_before_model_loading(monkeypatch, mode, quant):
+    monkeypatch.setattr(sys, "argv", ["basal-serve", "--mode", mode, "--quant", quant])
+    monkeypatch.setattr(server_module, "resolve", lambda *_: pytest.fail("must reject before loading a model"))
+    with pytest.raises(SystemExit, match="not supported"):
+        server_module.main()
+
+
+def test_default_mode_requires_both_mlx_packages_on_mps(monkeypatch):
+    monkeypatch.setattr(server_module.torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(server_module.torch.backends.mps, "is_available", lambda: True)
+    monkeypatch.setitem(sys.modules, "mlx_lm", None)
+    assert default_mode() == "mps"
 
 def swapped_prompts_differ(crit_a, crit_b, t="choice"):
     q = lambda c: to_items("Customer selected shipping service B.", {"q": {"type": t, "instructions": "Which code?",
