@@ -53,3 +53,15 @@ def test_cli_rejects_missing_converter_before_download(tmp_path, capsys):
     with pytest.raises(SystemExit) as e:
         main(["Remek/never-downloaded", str(tmp_path / "x.gguf"), "--llama-cpp", str(tmp_path)])
     assert e.value.code == 2 and "convert_hf_to_gguf.py not found" in capsys.readouterr().err
+
+
+def test_cli_creates_missing_output_directory(tmp_path):
+    from basal.gguf_export import main
+    llama = tmp_path / "llama.cpp"
+    llama.mkdir()
+    (llama / "convert_hf_to_gguf.py").write_text("import sys; sys.exit(3)\n")  # stops right after the temp dir
+    out = tmp_path / "new" / "dir" / "model.gguf"
+    with pytest.raises(SystemExit) as e:
+        main([str(tmp_path), str(out), "--llama-cpp", str(llama)])
+    assert "converter failed (exit 3)" in str(e.value.code) and out.parent.is_dir()
+

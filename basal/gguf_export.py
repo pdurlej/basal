@@ -114,6 +114,7 @@ def main(argv=None):
 
     model_dir = Path(a.model) if Path(a.model).exists() else Path(snapshot_download(a.model, revision=a.revision))
     out = Path(a.outfile)
+    out.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out.parent) as tmp:
         raw = Path(tmp) / "converted.gguf"
         done = subprocess.run([sys.executable, str(converter), str(model_dir), "--outtype", a.outtype, "--outfile", str(raw)])
